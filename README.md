@@ -102,6 +102,7 @@ cp .env.example .env
 FACE_DEMO_FACE_MATCH_THRESHOLD=0.42
 FACE_DEMO_FACE_MATCH_MIN_THRESHOLD=0.30
 FACE_DEMO_FACE_MATCH_MIN_PASS_RATIO=0.65
+FACE_DEMO_RELEASE_SHA=development
 FACE_DEMO_DATABASE_PATH=data/face_verify.sqlite3
 FACE_DEMO_INTERNAL_API_KEY=change-me-face-internal-key
 FACE_DEMO_CORS_ORIGINS=*
@@ -253,6 +254,7 @@ FACE_DEMO_ONNX_INTER_OP_THREADS=1
 ```bash
 curl -k https://<host>:<port>/api/health
 curl -k https://<host>:<port>/api/ready
+curl -k https://<host>:<port>/api/version
 curl -k -I https://<host>:<port>/static/app.js?v=20260606-face-verify
 PYTHONPYCACHEPREFIX=/tmp/face-verify-demo-pycache .venv/bin/python -m unittest discover -s tests -v
 ```
@@ -264,9 +266,12 @@ PYTHONPYCACHEPREFIX=/tmp/face-verify-demo-pycache .venv/bin/python -m unittest d
 ```http
 GET /api/health
 GET /api/ready
+GET /api/version
 ```
 
-`/api/health` 只表示进程可响应。`/api/ready` 会检查当前状态存储的三张表、监管/医生日志表和 PAD 模型文件；使用本地后备时则检查 SQLite 数据目录。探活不会预加载 InsightFace 或 PAD 大模型，避免拖慢低配机器。
+`/api/health` 只表示进程可响应。`/api/ready` 会检查当前状态存储的三张表、监管/医生日志表和 PAD 模型文件；使用本地后备时则检查 SQLite 数据目录。`/api/version` 返回部署时注入的完整 Git commit SHA，用于确认线上代码与发布产物一致。探活不会预加载 InsightFace 或 PAD 大模型，避免拖慢低配机器。
+
+正式环境以 `zhengshi` 分支为唯一来源，生产配置、`8005` systemd 单元、模型校验和以及部署后版本检查见 `deploy/README.md`。生产密钥和数据库密码只保存在服务器环境文件中，不进入仓库。
 
 ### 生产接口鉴权
 

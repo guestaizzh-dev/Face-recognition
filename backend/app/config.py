@@ -7,6 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="FACE_DEMO_")
 
+    release_sha: str = "development"
     database_path: str = "data/face_verify.sqlite3"
     state_db_dsn: str = ""
     state_db_template_table: str = "fa_face_service_template"

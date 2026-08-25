@@ -383,7 +383,7 @@ class VerificationGuardTests(unittest.TestCase):
 
         self.assertFalse(result["passed"])
 
-    def test_blink_event_accepts_five_percent_relaxed_drop(self):
+    def test_blink_event_rejects_subtle_drop(self):
         ears = np.array(
             [0.24, 0.24, 0.24, 0.24, 0.201, 0.201, 0.201, 0.24, 0.24, 0.24, 0.24, 0.24],
             dtype=np.float32,
@@ -391,7 +391,7 @@ class VerificationGuardTests(unittest.TestCase):
 
         result = _judge_blink_action("blink", ears, self.settings)
 
-        self.assertTrue(result["passed"], result["detail"])
+        self.assertFalse(result["passed"], result["detail"])
 
     def test_blink_event_accepts_low_baseline_with_clear_close_and_recovery(self):
         ears = np.array(
@@ -404,7 +404,7 @@ class VerificationGuardTests(unittest.TestCase):
         self.assertTrue(result["passed"], result["detail"])
         self.assertIn("baseline_min", result["detail"])
 
-    def test_blink_event_accepts_clear_close_at_capture_end(self):
+    def test_blink_event_rejects_close_without_recovery(self):
         ears = np.array(
             [0.20, 0.20, 0.198, 0.195, 0.19, 0.18, 0.14, 0.095, 0.055, 0.05, 0.05],
             dtype=np.float32,
@@ -412,9 +412,9 @@ class VerificationGuardTests(unittest.TestCase):
 
         result = _judge_blink_action("blink", ears, self.settings)
 
-        self.assertTrue(result["passed"], result["detail"])
+        self.assertFalse(result["passed"], result["detail"])
 
-    def test_smile_accepts_small_width_change_with_mouth_motion(self):
+    def test_smile_accepts_small_width_change_at_deployed_threshold(self):
         metrics = [
             FrameMetrics(ear=0.25, mar=0.20, mouth_width_ratio=0.410, yaw=0.0, pitch=0.0),
             FrameMetrics(ear=0.25, mar=0.21, mouth_width_ratio=0.416, yaw=0.0, pitch=0.0),
@@ -424,13 +424,13 @@ class VerificationGuardTests(unittest.TestCase):
             FrameMetrics(ear=0.25, mar=0.219, mouth_width_ratio=0.437, yaw=0.0, pitch=0.0),
         ]
 
-        result = _judge_action("smile", metrics, self.settings)
+        result = _judge_action("smile", metrics, Settings(smile_delta_threshold=0.015))
 
         self.assertTrue(result["passed"], result["detail"])
         self.assertIn("MAR delta", result["detail"])
 
-    def test_default_nod_threshold_is_relaxed_five_percent(self):
-        self.assertEqual(self.settings.nod_pitch_range_threshold, 8.0)
+    def test_default_nod_threshold_matches_deployed_relaxed_value(self):
+        self.assertEqual(self.settings.nod_pitch_range_threshold, 3.0)
 
     def test_face_match_requires_threshold_ratio_and_min_similarity(self):
         enrollment = np.array([1.0, 0.0], dtype=np.float32)

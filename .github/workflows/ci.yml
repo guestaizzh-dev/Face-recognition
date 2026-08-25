@@ -36,3 +36,36 @@ jobs:
         run: |
           node --check backend/static/app.js
           node scripts/test_frontend_static.js
+
+  package-production:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/zhengshi'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Check out exact release
+        uses: actions/checkout@v4
+
+      - name: Build commit-addressed release archive
+        run: |
+          mkdir -p dist
+          git archive --format=tar.gz --output="dist/face-verify-${GITHUB_SHA}.tar.gz" HEAD
+          sha256sum "dist/face-verify-${GITHUB_SHA}.tar.gz" > "dist/face-verify-${GITHUB_SHA}.sha256"
+          printf '{"release_sha":"%s","repository":"%s","workflow_run_id":"%s"}\n' \
+            "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > "dist/release.json"
+
+      - name: Attest release archive
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/face-verify-${{ github.sha }}.tar.gz
+
+      - name: Upload release archive and checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: face-verify-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error

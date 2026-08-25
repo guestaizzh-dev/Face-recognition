@@ -1,0 +1,17 @@
+<?php
+
+// Install as /www/wwwroot/leda/config/face_verify.php. The leda application
+// continues to use its own production database configuration. Keep the API
+// key in config/face_verify_api_key; never commit it to this repository.
+$apiKeyFile = __DIR__ . '/face_verify_api_key';
+
+return [
+    'base_url' => 'https://faces.chbzg.com.cn',
+    'public_base_url' => 'https://faces.chbzg.com.cn',
+    'api_key' => is_file($apiKeyFile) ? trim((string)file_get_contents($apiKeyFile)) : '',
+    'connect_timeout' => 3,
+    'timeout' => 120,
+    'shadow_mode' => false,
+    'policy_version' => 'production-v1',
+    'audit_trigger_overrides' => [],
+];

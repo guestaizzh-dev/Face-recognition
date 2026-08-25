@@ -118,7 +118,12 @@ def index() -> FileResponse:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True}
+    return {"ok": True, "release_sha": settings.release_sha}
+
+
+@app.get("/api/version")
+def version() -> dict:
+    return {"service": "face-verify", "release_sha": settings.release_sha}
 
 
 @app.get("/api/ready")
@@ -161,6 +166,7 @@ def ready() -> dict:
         )
     return {
         "ok": True,
+        "release_sha": settings.release_sha,
         "database_parent_exists": True,
         "missing_models": [],
         "state_store": state_store_schema,

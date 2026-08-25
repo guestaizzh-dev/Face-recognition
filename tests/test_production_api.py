@@ -145,8 +145,16 @@ class ProductionApiTests(unittest.TestCase):
         ready = main.ready()
 
         self.assertTrue(ready["ok"])
+        self.assertEqual(ready["release_sha"], main.settings.release_sha)
         self.assertTrue(ready["database_parent_exists"])
         self.assertEqual(ready["missing_models"], [])
+
+    def test_health_and_version_report_release_sha(self):
+        self.assertEqual(main.health()["release_sha"], main.settings.release_sha)
+        self.assertEqual(
+            main.version(),
+            {"service": "face-verify", "release_sha": main.settings.release_sha},
+        )
 
     def test_template_session_verify_proof_and_finalize_flow(self):
         template_response = main.create_template(

@@ -1,0 +1,32 @@
+[Unit]
+Description=Face Verify API (production)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=faceverify
+Group=faceverify
+WorkingDirectory=/opt/face-verify-demo/current
+EnvironmentFile=/opt/face-verify-demo/shared/.env
+EnvironmentFile=-/opt/face-verify-demo/shared/release.env
+Environment=PYTHONPYCACHEPREFIX=/opt/face-verify-demo/shared/pycache
+Environment=TMPDIR=/opt/face-verify-demo/shared/tmp
+Environment=MPLCONFIGDIR=/opt/face-verify-demo/shared/tmp/matplotlib
+ExecStart=/opt/face-verify-demo/shared/.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8005 --workers 1 --no-server-header
+Restart=always
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=30
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/face-verify-demo/shared/data /opt/face-verify-demo/shared/logs /opt/face-verify-demo/shared/pycache /opt/face-verify-demo/shared/tmp
+MemoryMax=1400M
+MemorySwapMax=0
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
