@@ -138,6 +138,8 @@ video {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  /* Mirror only the preview; captureCanvas still receives the original video frame. */
+  transform: scaleX(-1);
 }
 
 canvas {

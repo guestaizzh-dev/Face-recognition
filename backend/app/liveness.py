@@ -12,11 +12,11 @@ from .config import Settings
 
 
 ACTION_LABELS: Dict[str, str] = {
-    "blink": "请眨眼",
-    "mouth_open": "请张嘴",
-    "shake_head": "请左右摇头",
-    "nod_head": "请上下点头",
-    "smile": "请微笑",
+    "blink": "眨眼",
+    "mouth_open": "张嘴",
+    "shake_head": "左右转头",
+    "nod_head": "上下点头",
+    "smile": "微笑",
 }
 
 
@@ -130,43 +130,138 @@ def _judge_action(action: str, metrics: List[FrameMetrics], settings: Settings) 
         }
 
     if action == "shake_head":
-        yaw_range = float(np.max(yaws) - np.min(yaws))
-        passed = yaw_range > settings.shake_yaw_range_threshold
-        return {
-            "action": action,
-            "passed": passed,
-            "score": round(yaw_range, 4),
-            "detail": f"yaw range={yaw_range:.1f} deg",
-        }
+        return _judge_head_axis_action(
+            action,
+            yaws,
+            pitches,
+            settings.shake_yaw_range_threshold,
+            "yaw",
+            "pitch",
+            settings,
+        )
 
     if action == "nod_head":
-        pitch_range = float(np.max(pitches) - np.min(pitches))
-        passed = pitch_range > settings.nod_pitch_range_threshold
-        return {
-            "action": action,
-            "passed": passed,
-            "score": round(pitch_range, 4),
-            "detail": f"pitch range={pitch_range:.1f} deg",
-        }
+        return _judge_head_axis_action(
+            action,
+            pitches,
+            yaws,
+            settings.nod_pitch_range_threshold,
+            "pitch",
+            "yaw",
+            settings,
+        )
 
     if action == "smile":
-        smile_delta = float(np.max(smiles) - np.min(smiles))
+        # The first frames are the neutral reference.  A smile must widen the
+        # mouth after the prompt; a generic max/min swing is too easy to pass
+        # by simply moving the face or pursing the lips.
+        edge_count = max(1, int(np.ceil(len(smiles) * 0.2)))
+        baseline = float(np.median(smiles[:edge_count]))
+        peak_index = int(np.argmax(smiles))
+        peak = float(smiles[peak_index])
+        smile_delta = peak - baseline
         mar_delta = float(np.max(mars) - np.min(mars))
-        assisted_threshold = settings.smile_delta_threshold * 0.93
-        passed = smile_delta > settings.smile_delta_threshold or (
-            smile_delta >= assisted_threshold and mar_delta >= 0.018
+        passed = (
+            peak_index >= edge_count
+            and smile_delta + 1e-4 >= settings.smile_delta_threshold
         )
         return {
             "action": action,
             "passed": passed,
             "score": round(smile_delta, 4),
             "detail": (
-                f"mouth width ratio delta={smile_delta:.3f}, "
+                f"mouth width ratio baseline={baseline:.3f}, peak={peak:.3f}, "
+                f"delta={smile_delta:.3f}, peak_frame={peak_index}, "
                 f"MAR delta={mar_delta:.3f}"
             ),
         }
 
     return {"action": action, "passed": False, "score": 0.0, "detail": "未知动作"}
+
+
+def _judge_head_axis_action(
+    action: str,
+    primary_values: np.ndarray,
+    cross_values: np.ndarray,
+    threshold: float,
+    primary_name: str,
+    cross_name: str,
+    settings: Settings,
+) -> dict:
+    """Require dominant motion on the requested axis, regardless of travel order."""
+    # solvePnP can express the same near-front pose on either side of 180
+    # degrees.  Treating those raw Euler angles as a linear series turns a
+    # small movement such as 179 -> -179 into a fake 358 degree movement.
+    primary = _smooth_series(_normalize_head_pose_series(primary_values))
+    cross = _smooth_series(_normalize_head_pose_series(cross_values))
+    edge_count = max(1, int(np.ceil(len(primary) * 0.2)))
+    baseline = float(np.median(np.concatenate([primary[:edge_count], primary[-edge_count:]])))
+    primary_min = float(np.min(primary))
+    primary_max = float(np.max(primary))
+    primary_range = primary_max - primary_min
+    cross_range = float(np.max(cross) - np.min(cross))
+    lower_excursion = baseline - primary_min
+    upper_excursion = primary_max - baseline
+    # A nod naturally has a smaller measurable pitch range than a left-right
+    # turn on laptop cameras. Accept either travel order (left -> right or
+    # right -> left, and likewise for up/down).
+    min_side_excursion = 1.5 if action == "nod_head" else 2.0
+    side_threshold = max(min_side_excursion, threshold * 0.30)
+    # People naturally move a little on the other axis while turning or
+    # nodding.  The old 55% ratio rejected normal left/right turns whenever
+    # the chin rose or fell slightly.  Keep an absolute tolerance for that
+    # natural movement, but require the requested axis to remain dominant so
+    # a nod cannot be accepted as a head shake (and vice versa).
+    cross_axis_limit = max(
+        settings.head_axis_cross_tolerance_degrees,
+        primary_range * settings.head_axis_cross_range_ratio,
+    )
+    cross_axis_ok = cross_range <= cross_axis_limit
+    passed = (
+        primary_range > threshold
+        and max(lower_excursion, upper_excursion) >= side_threshold
+        and cross_axis_ok
+    )
+    return {
+        "action": action,
+        "passed": bool(passed),
+        "score": round(primary_range, 4),
+        "detail": (
+            f"{primary_name} range={primary_range:.1f} deg, "
+            f"{cross_name} range={cross_range:.1f} deg, "
+            f"side_excursion={lower_excursion:.1f}/{upper_excursion:.1f} deg, "
+            f"axis_isolated={cross_axis_ok}, repeated_motion=allowed, direction_order=any, "
+            f"cross_limit={cross_axis_limit:.1f} deg"
+        ),
+    }
+
+
+def _normalize_head_pose_series(values: np.ndarray) -> np.ndarray:
+    """Return a stable signed head-pose series in the [-90, 90] range.
+
+    OpenCV's Euler decomposition has equivalent representations that differ
+    by 180 degrees.  Folding the alternate representation back to the
+    front-facing range prevents a wraparound from being treated as motion.
+    Isolated landmark/PnP spikes are replaced only when both adjacent frames
+    agree, so genuine continuous head movement is preserved.
+    """
+    raw = np.asarray(values, dtype=np.float32)
+    normalized = np.remainder(raw + 180.0, 360.0) - 180.0
+    canonical = normalized.copy()
+    canonical[canonical > 90.0] = 180.0 - canonical[canonical > 90.0]
+    canonical[canonical < -90.0] = -180.0 - canonical[canonical < -90.0]
+
+    if len(canonical) < 3:
+        return canonical.astype(np.float32)
+
+    stabilized = canonical.copy()
+    max_isolated_jump = 35.0
+    for index in range(1, len(canonical) - 1):
+        neighbor_center = float((canonical[index - 1] + canonical[index + 1]) / 2.0)
+        neighbors_are_stable = abs(float(canonical[index - 1] - canonical[index + 1])) <= max_isolated_jump
+        if neighbors_are_stable and abs(float(canonical[index] - neighbor_center)) > max_isolated_jump:
+            stabilized[index] = neighbor_center
+    return stabilized.astype(np.float32)
 
 
 def _judge_blink_action(action: str, ears: np.ndarray, settings: Settings) -> dict:
@@ -177,45 +272,31 @@ def _judge_blink_action(action: str, ears: np.ndarray, settings: Settings) -> di
     trough_index = int(np.argmin(smoothed))
     trough = float(smoothed[trough_index])
     drop = baseline - trough
-    drop_threshold = max(0.036, baseline * 0.145)
-    baseline_threshold = settings.blink_ear_threshold * 0.9
-    relaxed_baseline_threshold = max(0.12, settings.blink_ear_threshold * 0.6)
+    # Require a clear close-and-reopen cycle.  Small landmark jitter or a
+    # capture that ends while the eyes are closing must not count as a blink.
+    drop_threshold = max(0.045, baseline * 0.18)
+    baseline_threshold = settings.blink_ear_threshold
+    relaxed_baseline_threshold = max(0.14, settings.blink_ear_threshold * 0.7)
 
     before_peak = float(np.max(smoothed[:trough_index])) if trough_index > 0 else 0.0
     after_peak = float(np.max(smoothed[trough_index + 1:])) if trough_index + 1 < len(smoothed) else 0.0
     closed_threshold = baseline - drop_threshold * 0.55
     closed_ratio = float(np.mean(smoothed <= closed_threshold))
-    recovery_ok = after_peak >= baseline * 0.76
-    endpoint_close_ok = (
-        trough_index >= len(smoothed) - max(2, int(np.ceil(len(smoothed) * 0.2)))
-        and drop >= drop_threshold * 1.2
-        and before_peak >= baseline * 0.85
-        and closed_ratio <= 0.60
-    )
+    recovery_ok = after_peak >= baseline * 0.82
     baseline_ok = baseline >= baseline_threshold or (
         baseline >= relaxed_baseline_threshold
-        and drop >= drop_threshold
+        and drop >= drop_threshold * 1.3
         and before_peak >= baseline * 0.85
-        and (recovery_ok or endpoint_close_ok)
+        and recovery_ok
     )
     passed = (
         baseline_ok
         and drop >= drop_threshold
         and before_peak >= baseline * 0.85
-        and (recovery_ok or endpoint_close_ok)
-        and 0 < trough_index
-        and closed_ratio <= 0.70
-    )
-    strong_blink = (
-        drop >= drop_threshold * 1.8
-        and trough <= baseline * 0.65
-        and before_peak >= baseline * 0.80
         and recovery_ok
-        and 0 < trough_index
-        and trough_index < len(smoothed) - 1
-        and closed_ratio <= 0.58
+        and edge_count <= trough_index < len(smoothed) - edge_count
+        and closed_ratio <= 0.55
     )
-    passed = passed or strong_blink
     return {
         "action": action,
         "passed": bool(passed),
@@ -224,8 +305,7 @@ def _judge_blink_action(action: str, ears: np.ndarray, settings: Settings) -> di
             f"EAR baseline={baseline:.3f}, trough={trough:.3f}, "
             f"drop={drop:.3f}/{drop_threshold:.3f}, "
             f"baseline_min={relaxed_baseline_threshold:.3f}, "
-            f"recovery={after_peak:.3f}, closed_ratio={closed_ratio:.0%}, "
-            f"strong_blink={strong_blink}"
+            f"recovery={after_peak:.3f}, closed_ratio={closed_ratio:.0%}"
         ),
     }
 

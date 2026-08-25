@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 MAX_VERIFY_FRAMES = 90
+MAX_LIVENESS_PROBE_FRAMES = 48
 
 
 class EnrollResponse(BaseModel):
@@ -152,12 +153,22 @@ class VerificationSessionCreateResponse(BaseModel):
     actions: List[str]
     labels: Dict[str, str]
     expires_at: datetime
+    retry_after: int = 0
 
 
 class VerificationSessionVerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     frames: List[FramePayload] = Field(..., min_length=1, max_length=MAX_VERIFY_FRAMES)
+
+
+class VerificationSessionProbeRequest(BaseModel):
+    """Check one expected action without consuming the verification session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: str = Field(..., min_length=1, max_length=32)
+    frames: List[FramePayload] = Field(..., min_length=1, max_length=MAX_LIVENESS_PROBE_FRAMES)
 
 
 class VerificationSessionVerifyResponse(BaseModel):
@@ -172,6 +183,7 @@ class VerificationSessionVerifyResponse(BaseModel):
     threshold: Optional[float] = None
     action_results: List[ActionResult]
     message: str
+    retry_after: int = 0
 
 
 class SlotProbeRequest(BaseModel):

@@ -24,7 +24,9 @@ from .config import Settings, get_settings
 from .face_engine import FaceEngine, cosine_similarity, decode_base64_image, decode_image_bytes
 from .liveness import ACTION_LABELS, _extract_metrics, random_actions, verify_liveness_actions
 from .rate_limit import InMemoryFailureLimiter
+from .regulator_store import RegulatorStore, RegulatorStoreError
 from .schemas import (
+    ActionResult,
     ChallengeRequest,
     ChallengeResponse,
     CompareRequest,
@@ -45,6 +47,7 @@ from .schemas import (
     VerifyLivenessResponse,
     VerificationSessionCreateRequest,
     VerificationSessionCreateResponse,
+    VerificationSessionProbeRequest,
     VerificationSessionVerifyRequest,
     VerificationSessionVerifyResponse,
 )
@@ -56,6 +59,7 @@ from .verification_slot import VerificationSlot
 settings = get_settings()
 face_engine = FaceEngine(settings)
 anti_spoofing_model = AntiSpoofingModel(settings)
+regulator_store = RegulatorStore(settings)
 failure_limiter = InMemoryFailureLimiter()
 verification_semaphore = BoundedSemaphore(max(1, settings.verification_max_concurrent_requests))
 verification_metrics = ConcurrencyMetrics(recent_window=settings.verification_metrics_window)
@@ -121,22 +125,67 @@ def health() -> dict:
 def ready() -> dict:
     model_paths = _configured_model_paths(settings) + _configured_insightface_model_paths(settings)
     missing_models = [str(path) for path in model_paths if not path.exists()]
-    database_parent = getattr(store, "database_path", Path("data/face_verify.sqlite3")).parent
-    ok = database_parent.exists() and not missing_models
+    database_path = getattr(store, "database_path", None)
+    database_parent_exists = database_path is None or database_path.parent.exists()
+    state_store_schema = None
+    state_store_error = None
+    try:
+        state_store_schema = store.check_schema()
+    except Exception as exc:
+        state_store_error = str(exc)
+    regulator_schema = None
+    regulator_error = None
+    if regulator_store.enabled:
+        try:
+            regulator_schema = regulator_store.check_schema()
+        except RegulatorStoreError as exc:
+            regulator_error = str(exc)
+    ok = (
+        database_parent_exists
+        and not missing_models
+        and state_store_error is None
+        and regulator_error is None
+    )
     if not ok:
         raise HTTPException(
             status_code=503,
             detail={
                 "ok": False,
-                "database_parent_exists": database_parent.exists(),
+                "database_parent_exists": database_parent_exists,
                 "missing_models": missing_models,
+                "state_store": state_store_schema,
+                "state_store_error": state_store_error,
+                "regulator_db": regulator_schema,
+                "regulator_db_error": regulator_error,
             },
         )
     return {
         "ok": True,
         "database_parent_exists": True,
         "missing_models": [],
+        "state_store": state_store_schema,
+        "regulator_db": regulator_schema,
     }
+
+
+def _write_regulator_result(
+    session,
+    status: str,
+    result_code: str,
+    result_msg: str,
+    request: Optional[Request] = None,
+) -> None:
+    try:
+        regulator_store.record_result(
+            session,
+            status,
+            result_code,
+            result_msg,
+            client_ip=_client_ip(request) if request is not None else "",
+            user_agent=request.headers.get("user-agent", "") if request is not None else "",
+        )
+    except RegulatorStoreError as exc:
+        raise HTTPException(status_code=503, detail=f"监管结果写入失败：{exc}") from exc
 
 
 @app.post("/api/enroll", response_model=EnrollResponse)
@@ -454,13 +503,69 @@ def create_verification_session(
         raise HTTPException(status_code=404, detail="未找到有效人脸模板，请先登记基准人脸")
 
     background_tasks.add_task(_preload_anti_spoofing_model)
+    retry_after = 0
+    if payload.scene not in settings.verification_failure_exempt_scene_set:
+        retry_after = failure_limiter.retry_after_seconds(
+            _failure_limit_key_for_subject(payload.subject_type, payload.subject_id, payload.scene)
+        )
     return VerificationSessionCreateResponse(
         session_id=session.session_id,
         upload_token=session.upload_token,
         actions=session.expected_actions,
         labels=ACTION_LABELS,
         expires_at=session.expires_at,
+        retry_after=retry_after,
     )
+
+
+@app.post(
+    "/v1/verification-sessions/{session_id}/probe",
+    response_model=ActionResult,
+)
+def probe_verification_session_action(
+    session_id: str,
+    payload: VerificationSessionProbeRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> ActionResult:
+    """Check one session action without consuming or changing the session."""
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="核验会话不存在")
+    if session.is_expired():
+        raise HTTPException(status_code=410, detail="核验会话已过期，请重新发起")
+    if session.status != "issued":
+        raise HTTPException(status_code=409, detail="核验会话已使用，请重新发起")
+    upload_token = _extract_bearer_token(authorization)
+    if not upload_token or not store.verify_upload_token(session_id, upload_token):
+        raise HTTPException(status_code=401, detail="上传令牌无效")
+    if payload.action not in session.expected_actions:
+        raise HTTPException(status_code=400, detail="当前动作不属于本次核验会话")
+    if any(frame.action != payload.action for frame in payload.frames):
+        raise HTTPException(status_code=400, detail="动作探测帧类型不一致")
+    if len(payload.frames) > settings.max_frames_per_action:
+        raise HTTPException(
+            status_code=400,
+            detail=f"动作探测帧过多：{len(payload.frames)}/{settings.max_frames_per_action}",
+        )
+    indexes = [frame.index for frame in payload.frames]
+    if indexes != list(range(len(payload.frames))):
+        raise HTTPException(status_code=400, detail="动作探测帧序号不连续")
+    timestamps = [float(frame.timestamp) for frame in payload.frames]
+    if any(right < left for left, right in zip(timestamps, timestamps[1:])):
+        raise HTTPException(status_code=400, detail="动作探测帧时间戳顺序不正确")
+
+    frames = []
+    for frame in payload.frames:
+        if len(frame.image) > settings.max_frame_base64_chars:
+            raise HTTPException(status_code=400, detail="单帧图片太大，请降低摄像头采集分辨率")
+        try:
+            frames.append(decode_base64_image(frame.image, settings.max_upload_bytes))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    with _VerificationSlot():
+        result = verify_liveness_actions({payload.action: frames}, [payload.action], settings)[0]
+    return ActionResult(**result)
 
 
 @app.post(
@@ -480,15 +585,23 @@ def verify_verification_session(
     session = store.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="核验会话不存在")
-    if session.is_expired():
-        store.mark_session_failed(session_id, "EXPIRED_SESSION")
-        raise HTTPException(status_code=410, detail="核验会话已过期，请重新发起")
-    if session.status != "issued":
-        raise HTTPException(status_code=409, detail="核验会话已使用，请重新发起")
 
     upload_token = _extract_bearer_token(authorization)
     if not upload_token or not store.verify_upload_token(session_id, upload_token):
         raise HTTPException(status_code=401, detail="上传令牌无效")
+
+    if session.status != "issued":
+        raise HTTPException(status_code=409, detail="核验会话已使用，请重新发起")
+    if session.is_expired():
+        store.mark_session_failed(session_id, "EXPIRED_SESSION")
+        _write_regulator_result(
+            session,
+            "expired",
+            "EXPIRED_SESSION",
+            "核验会话已过期",
+            request,
+        )
+        raise HTTPException(status_code=410, detail="核验会话已过期，请重新发起")
 
     try:
         template = store.get_template(session.template_id)
@@ -496,10 +609,19 @@ def verify_verification_session(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if template is None or template.status != "active":
         store.mark_session_failed(session_id, "FAIL_TEMPLATE_INVALID")
+        _write_regulator_result(
+            session,
+            "failed",
+            "FAIL_TEMPLATE_INVALID",
+            "人脸模板无效，请重新登记",
+            request,
+        )
         raise HTTPException(status_code=409, detail="人脸模板无效，请重新登记")
 
     failure_key = _failure_limit_key(session, _client_ip(request))
-    _raise_if_failure_limited(failure_key, settings)
+    failure_limit_exempt = _failure_limit_exempt(session, settings)
+    if not failure_limit_exempt:
+        _raise_if_failure_limited(failure_key, settings)
 
     verification_attempt = store.start_session_verification(session_id)
     if not verification_attempt:
@@ -519,9 +641,13 @@ def verify_verification_session(
             store.reset_session_verification(session_id, verification_attempt)
         else:
             store.mark_session_failed(session_id, result_code, verification_attempt)
+            _write_regulator_result(session, "failed", result_code, str(exc.detail), request)
         raise
     except Exception as exc:
         store.mark_session_failed(session_id, "ERROR_INTERNAL", verification_attempt)
+        _write_regulator_result(
+            session, "failed", "ERROR_INTERNAL", "核验处理失败", request
+        )
         raise HTTPException(status_code=500, detail="核验处理失败，请稍后重试") from exc
 
     proof_id = None
@@ -543,7 +669,16 @@ def verify_verification_session(
             verification_attempt,
             action_results=evaluation.action_results,
         )
-    _record_failure_limit_result(failure_key, evaluation.passed, settings)
+    retry_after = 0
+    if not failure_limit_exempt:
+        retry_after = _record_failure_limit_result(failure_key, evaluation.passed, settings)
+    _write_regulator_result(
+        session,
+        "success" if evaluation.passed else "failed",
+        evaluation.result_code,
+        evaluation.message,
+        request,
+    )
 
     return VerificationSessionVerifyResponse(
         session_id=session_id,
@@ -557,6 +692,7 @@ def verify_verification_session(
         threshold=evaluation.threshold,
         action_results=evaluation.action_results,
         message=evaluation.message,
+        retry_after=retry_after,
     )
 
 
@@ -701,11 +837,27 @@ def _select_liveness_actions(
 
 
 def _failure_limit_key(session, client_ip: str) -> str:
-    return "|".join([
+    return _failure_limit_key_for_subject(
         session.subject_type,
         session.subject_id,
         session.scene,
-        client_ip or "unknown",
+        client_ip,
+    )
+
+
+def _failure_limit_key_for_subject(
+    subject_type: str,
+    subject_id: str,
+    scene: str,
+    client_ip: str = "",
+) -> str:
+    # Login cooldown follows the doctor identity across cancel/re-login and IP changes.
+    # Other scenes retain the existing subject + scene + client-IP isolation.
+    parts = [subject_type, subject_id, scene]
+    if scene != "login":
+        parts.append(client_ip or "unknown")
+    return "|".join([
+        str(part) for part in parts
     ])
 
 
@@ -714,6 +866,10 @@ def _client_ip(request: Request) -> str:
     if forwarded:
         return forwarded.split(",", 1)[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+def _failure_limit_exempt(session, settings: Settings) -> bool:
+    return session.scene in settings.verification_failure_exempt_scene_set
 
 
 def _raise_if_failure_limited(key: str, settings: Settings) -> None:
@@ -728,13 +884,13 @@ def _raise_if_failure_limited(key: str, settings: Settings) -> None:
         )
 
 
-def _record_failure_limit_result(key: str, passed: bool, settings: Settings) -> None:
+def _record_failure_limit_result(key: str, passed: bool, settings: Settings) -> int:
     if not settings.verification_failure_limit_enabled:
-        return
+        return 0
     if passed:
         failure_limiter.clear(key)
-        return
-    failure_limiter.record_failure(
+        return 0
+    return failure_limiter.record_failure(
         key,
         settings.verification_failure_max_attempts,
         settings.verification_failure_window_seconds,

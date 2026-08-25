@@ -41,7 +41,8 @@ face-verify-demo/
       liveness.py          # Random liveness actions and action checks
       anti_spoofing.py     # MiniFASNet ONNX inference
       schemas.py           # API request / response models
-      stores.py            # Demo 内存 enrollment/challenge + SQLite template/session/proof store
+      stores.py            # Demo 内存状态 + SQLite 本地后备
+      mysql_store.py       # MySQL template/session/proof 状态存储
     static/
       index.html
       styles.css
@@ -144,6 +145,45 @@ FACE_DEMO_ANTI_SPOOFING_THRESHOLD=0.35
 FACE_DEMO_ANTI_SPOOFING_MODEL_PATH=models/MiniFASNetV1SE.onnx,models/MiniFASNetV2.yakhyo.onnx
 ```
 
+### MySQL 状态存储
+
+测试和生产环境应将模板、核验会话和一次性 proof 保存到 MySQL，SQLite 只作为本地开发和单元测试后备：
+
+```bash
+FACE_DEMO_STATE_DB_DSN=mysql+pymysql://face_verify:<password>@127.0.0.1:3306/chbzg_test
+FACE_DEMO_STATE_DB_TEMPLATE_TABLE=fa_face_service_template
+FACE_DEMO_STATE_DB_SESSION_TABLE=fa_face_service_session
+FACE_DEMO_STATE_DB_PROOF_TABLE=fa_face_service_proof
+```
+
+三张服务内部表与业务侧 `fa_face_profile`、`fa_face_verify_event`、`fa_face_verify_consumption` 分工不同。内部表保存加密向量、上传令牌、随机动作和 proof 状态；业务表继续由 PHP 负责登录策略、业务事件和 proof 消费，不能互相替代。
+
+首次从 SQLite 切换前，先备份原文件，再执行幂等迁移：
+
+```bash
+cp data/face_verify.sqlite3 data/face_verify.sqlite3.before-mysql
+python scripts/migrate_sqlite_state_to_mysql.py --source data/face_verify.sqlite3
+python scripts/migrate_sqlite_state_to_mysql.py --source data/face_verify.sqlite3 --check-only
+```
+
+迁移遇到相同主键但内容不同会整批回滚，不会覆盖目标记录。迁移后原 SQLite 文件仅作为回滚备份，不再被已配置 MySQL DSN 的服务读写。
+
+### 监管结果表写入（可选）
+
+测试环境如需把医生核验结果写入已有的 `fa_face_verify_regulator_status`，只需配置监管库 DSN：
+
+```bash
+FACE_DEMO_REGULATOR_DB_ENABLED=1
+FACE_DEMO_REGULATOR_DB_DSN=mysql+pymysql://face_verify:<password>@127.0.0.1:3306/chbzg_test
+FACE_DEMO_REGULATOR_DB_TABLE=fa_face_verify_regulator_status
+FACE_DEMO_DOCTOR_FACE_LOG_ENABLED=1
+FACE_DEMO_DOCTOR_FACE_LOG_TABLE=fa_doctor_face_verify_log
+```
+
+服务始终写监管状态表；启用医生日志后，仅对 `subject_type=doctor` 同步写入 `fa_doctor_face_verify_log`。医生日志的 `detail` 保存 `business_event_id`、状态、结果码、结果说明、场景和动作，用于与监管状态记录关联；同时记录请求 IP 和 User-Agent。写入成功、失败、过期三种结果，非医生流程不会写医生日志表。
+
+监管状态表的写入字段与现有 DDL 一致：`business_event_id`、`record_id`、`subject_type`、`subject_id`、`scene`、`action`、`status`、`result_code`、`result_msg`、`created_at`、`updated_at`。`status` 使用 `success`、`failed`、`expired`，同一业务事件重复写入会更新结果而不会新增重复行。`/api/ready` 会同时核对两张已启用表的结构。
+
 阈值需要用你的摄像头、光照、真人样本、照片、屏幕、视频回放和低性能设备重新校准。图像质量门禁会先拦截明显模糊、过暗、过曝、低对比度、脸过小、脸框明显越界或姿态明显偏转的登记照和活体抽样帧，避免烂图污染模板或进入重模型推理。
 
 生产环境建议设置 `FACE_DEMO_TEMPLATE_ENCRYPTION_KEY` 并开启 `FACE_DEMO_TEMPLATE_ENCRYPTION_REQUIRED=1`，这样新登记的人脸 embedding 会加密落库。旧明文模板仍可兼容读取，确认密钥配置无误后再逐步迁移。失败次数限制和验证并发保护为进程内实现，单机可以防止异常重试拖垮服务，多实例场景需要在网关层配合限流。
@@ -226,7 +266,7 @@ GET /api/health
 GET /api/ready
 ```
 
-`/api/health` 只表示进程可响应。`/api/ready` 会检查 SQLite 数据目录和 PAD 模型文件是否存在，不会预加载 InsightFace 或 PAD 大模型，避免探活拖慢低配机器。
+`/api/health` 只表示进程可响应。`/api/ready` 会检查当前状态存储的三张表、监管/医生日志表和 PAD 模型文件；使用本地后备时则检查 SQLite 数据目录。探活不会预加载 InsightFace 或 PAD 大模型，避免拖慢低配机器。
 
 ### 生产接口鉴权
 
