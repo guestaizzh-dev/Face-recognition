@@ -67,32 +67,56 @@ class FrameMetrics:
     pitch: float
 
 
-def verify_liveness_actions(
-    frames_by_action: Dict[str, List[np.ndarray]],
-    expected_actions: Iterable[str],
-    settings: Settings,
-) -> List[dict]:
-    results: List[dict] = []
-    with mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=False,
+def create_face_mesh(static_image_mode: bool = False):
+    """Create the shared FaceMesh graph used by one verification request."""
+    return mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=static_image_mode,
         max_num_faces=1,
         refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
-    ) as face_mesh:
-        for action in expected_actions:
-            frames = frames_by_action.get(action, [])
-            metrics = [_extract_metrics(frame, face_mesh) for frame in frames]
-            metrics = [item for item in metrics if item is not None]
-            result = _judge_action(action, metrics, settings)
-            result["label"] = ACTION_LABELS[action]
-            result["face_frames"] = len(metrics)
-            result["total_frames"] = len(frames)
-            face_frame_ratio = len(metrics) / max(len(frames), 1)
-            if result["passed"] and face_frame_ratio < settings.min_face_frame_ratio:
-                result["passed"] = False
-                result["detail"] += f"，有效人脸帧占比不足 {face_frame_ratio:.0%}"
-            results.append(result)
+    )
+
+
+def verify_liveness_actions(
+    frames_by_action: Dict[str, List[np.ndarray]],
+    expected_actions: Iterable[str],
+    settings: Settings,
+    face_mesh=None,
+) -> List[dict]:
+    # Callers that already own a graph can reuse it for pose checks.  Keeping
+    # the default context here preserves the public helper's existing behavior.
+    if face_mesh is None:
+        with create_face_mesh() as owned_face_mesh:
+            return _verify_liveness_actions(
+                frames_by_action,
+                expected_actions,
+                settings,
+                owned_face_mesh,
+            )
+    return _verify_liveness_actions(frames_by_action, expected_actions, settings, face_mesh)
+
+
+def _verify_liveness_actions(
+    frames_by_action: Dict[str, List[np.ndarray]],
+    expected_actions: Iterable[str],
+    settings: Settings,
+    face_mesh,
+) -> List[dict]:
+    results: List[dict] = []
+    for action in expected_actions:
+        frames = frames_by_action.get(action, [])
+        metrics = [_extract_metrics(frame, face_mesh) for frame in frames]
+        metrics = [item for item in metrics if item is not None]
+        result = _judge_action(action, metrics, settings)
+        result["label"] = ACTION_LABELS[action]
+        result["face_frames"] = len(metrics)
+        result["total_frames"] = len(frames)
+        face_frame_ratio = len(metrics) / max(len(frames), 1)
+        if result["passed"] and face_frame_ratio < settings.min_face_frame_ratio:
+            result["passed"] = False
+            result["detail"] += f"，有效人脸帧占比不足 {face_frame_ratio:.0%}"
+        results.append(result)
     return results
 
 

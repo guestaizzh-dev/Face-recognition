@@ -5,7 +5,7 @@ import binascii
 import os
 from dataclasses import dataclass
 from threading import BoundedSemaphore, Lock
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import cv2
 import numpy as np
@@ -60,16 +60,26 @@ class FaceEngine:
         self._load_lock = Lock()
         max_concurrent = max(1, int(self.settings.insightface_max_concurrent_inferences))
         self._inference_gate = BoundedSemaphore(max_concurrent)
-        self._apps: Dict[int, FaceAnalysis] = {}
+        # FaceAnalysis owns several ONNX Runtime sessions.  Keeping one instance
+        # per detection size can nearly double the resident set on production.
+        # Use the larger configured size for both enrollment and live checks so
+        # callers can still pass the legacy det_size argument without loading a
+        # second model graph.
+        self._app: Optional[FaceAnalysis] = None
+        self._det_size = max(
+            int(self.settings.insightface_det_size),
+            int(self.settings.insightface_live_det_size),
+        )
 
     def _ensure_loaded(self, det_size: Optional[int] = None) -> FaceAnalysis:
-        det_size = int(det_size or self.settings.insightface_det_size)
-        if det_size not in self._apps:
+        # ``det_size`` is retained for API compatibility.  SCRFD's input size
+        # is part of the loaded model state, so changing it per request would
+        # either race or require another full FaceAnalysis instance.
+        if self._app is None:
             with self._load_lock:
-                if det_size in self._apps:
-                    return self._apps[det_size]
-                self._apps[det_size] = self._create_app(det_size)
-        return self._apps[det_size]
+                if self._app is None:
+                    self._app = self._create_app(self._det_size)
+        return self._app
 
     def _create_app(self, det_size: int) -> FaceAnalysis:
         app = FaceAnalysis(
@@ -117,17 +127,27 @@ def _bbox_area(bbox: np.ndarray) -> float:
     return max(0.0, float(x2 - x1)) * max(0.0, float(y2 - y1))
 
 
-def decode_image_bytes(data: bytes, max_bytes: int) -> np.ndarray:
+def decode_image_bytes(
+    data: bytes,
+    max_bytes: int,
+    max_pixels: Optional[int] = None,
+    max_dimension: Optional[int] = None,
+) -> np.ndarray:
     if len(data) > max_bytes:
         raise ValueError("图片太大")
     arr = np.frombuffer(data, dtype=np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if bgr is None:
         raise ValueError("无法解析图片")
-    return bgr
+    return _bound_decoded_image(bgr, max_pixels=max_pixels, max_dimension=max_dimension)
 
 
-def decode_base64_image(value: str, max_bytes: int) -> np.ndarray:
+def decode_base64_image(
+    value: str,
+    max_bytes: int,
+    max_pixels: Optional[int] = None,
+    max_dimension: Optional[int] = None,
+) -> np.ndarray:
     value = value.strip()
     if "," in value and value.startswith("data:"):
         header, value = value.split(",", 1)
@@ -137,7 +157,36 @@ def decode_base64_image(value: str, max_bytes: int) -> np.ndarray:
         raw = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ValueError("图片 base64 编码无效") from exc
-    return decode_image_bytes(raw, max_bytes=max_bytes)
+    return decode_image_bytes(
+        raw,
+        max_bytes=max_bytes,
+        max_pixels=max_pixels,
+        max_dimension=max_dimension,
+    )
+
+
+def _bound_decoded_image(
+    bgr: np.ndarray,
+    max_pixels: Optional[int],
+    max_dimension: Optional[int],
+) -> np.ndarray:
+    """Keep decoded camera images bounded while preserving their aspect ratio."""
+    height, width = bgr.shape[:2]
+    scale = 1.0
+    if max_pixels and max_pixels > 0:
+        scale = min(scale, (float(max_pixels) / max(width * height, 1)) ** 0.5)
+    if max_dimension and max_dimension > 0:
+        scale = min(scale, float(max_dimension) / max(width, height, 1))
+    if scale >= 1.0:
+        return bgr
+
+    target_width = max(1, int(round(width * scale)))
+    target_height = max(1, int(round(height * scale)))
+    if max_pixels and target_width * target_height > max_pixels:
+        pixel_scale = (float(max_pixels) / (target_width * target_height)) ** 0.5
+        target_width = max(1, int(target_width * pixel_scale))
+        target_height = max(1, int(target_height * pixel_scale))
+    return cv2.resize(bgr, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:

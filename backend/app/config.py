@@ -105,6 +105,11 @@ class Settings(BaseSettings):
 
     max_upload_bytes: int = 8 * 1024 * 1024
     max_frame_base64_chars: int = 768 * 1024
+    # Bound decoded image memory as well as the compressed upload size.  The
+    # frontend captures 360px-wide frames; larger client uploads are reduced
+    # proportionally before they reach the face models.
+    max_image_pixels: int = 1_228_800
+    max_image_dimension: int = 1280
 
     @property
     def verification_failure_exempt_scene_set(self) -> set[str]:

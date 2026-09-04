@@ -22,7 +22,7 @@ from .anti_spoofing import AntiSpoofingModel
 from .concurrency_metrics import ConcurrencyMetrics
 from .config import Settings, get_settings
 from .face_engine import FaceEngine, cosine_similarity, decode_base64_image, decode_image_bytes
-from .liveness import ACTION_LABELS, _extract_metrics, random_actions, verify_liveness_actions
+from .liveness import ACTION_LABELS, _extract_metrics, create_face_mesh, random_actions, verify_liveness_actions
 from .rate_limit import InMemoryFailureLimiter
 from .regulator_store import RegulatorStore, RegulatorStoreError
 from .schemas import (
@@ -198,7 +198,13 @@ def _write_regulator_result(
 def enroll_face(file: UploadFile = File(...)) -> EnrollResponse:
     raw = file.file.read()
     try:
-        bgr = decode_image_bytes(raw, settings.max_upload_bytes)
+        bgr = decode_image_bytes(
+            raw,
+            settings.max_upload_bytes,
+            max_pixels=settings.max_image_pixels,
+            max_dimension=settings.max_image_dimension,
+        )
+        raw = b""
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -383,7 +389,14 @@ def create_template(
     _authorized: bool = Depends(_require_internal_api_key),
 ) -> TemplateCreateResponse:
     try:
-        bgr = decode_base64_image(payload.image, settings.max_upload_bytes)
+        bgr = decode_base64_image(
+            payload.image,
+            settings.max_upload_bytes,
+            max_pixels=settings.max_image_pixels,
+            max_dimension=settings.max_image_dimension,
+        )
+        source_hash = hashlib.sha256(payload.image.encode("utf-8")).hexdigest()
+        payload.image = ""
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -418,7 +431,6 @@ def create_template(
     if not pose_quality["passed"]:
         raise HTTPException(status_code=400, detail=f"基准人脸姿态不达标：{pose_quality['detail']}")
 
-    source_hash = hashlib.sha256(payload.image.encode("utf-8")).hexdigest()
     try:
         template = store.create_template(
             subject_type=payload.subject_type,
@@ -565,7 +577,15 @@ def probe_verification_session_action(
         if len(frame.image) > settings.max_frame_base64_chars:
             raise HTTPException(status_code=400, detail="单帧图片太大，请降低摄像头采集分辨率")
         try:
-            frames.append(decode_base64_image(frame.image, settings.max_upload_bytes))
+            frames.append(
+                decode_base64_image(
+                    frame.image,
+                    settings.max_upload_bytes,
+                    max_pixels=settings.max_image_pixels,
+                    max_dimension=settings.max_image_dimension,
+                )
+            )
+            frame.image = ""
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -934,9 +954,17 @@ def _evaluate_liveness_frames(
         if len(frame.image) > settings.max_frame_base64_chars:
             raise HTTPException(status_code=400, detail="单帧图片太大，请降低摄像头采集分辨率")
         try:
-            bgr = decode_base64_image(frame.image, settings.max_upload_bytes)
+            bgr = decode_base64_image(
+                frame.image,
+                settings.max_upload_bytes,
+                max_pixels=settings.max_image_pixels,
+                max_dimension=settings.max_image_dimension,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # The decoded array is all downstream stages need. Drop the large
+        # Base64 string from the request model before the next frame is decoded.
+        frame.image = ""
         frames_by_action[frame.action].append(bgr)
         all_frames.append(bgr)
 
@@ -976,32 +1004,53 @@ def _evaluate_liveness_frames(
             message="摄像头帧重复度过高",
         )
 
-    liveness_action_results = verify_liveness_actions(frames_by_action, expected_actions, settings)
-    action_passed = all(item["passed"] for item in liveness_action_results)
-    action_results.extend(liveness_action_results)
-    if not action_passed:
-        return VerificationEvaluation(
-            passed=False,
-            result_code="FAIL_ACTION",
-            anti_spoofing_passed=False,
-            anti_spoofing_score=0.0,
-            face_matched=False,
-            similarity=None,
-            threshold=settings.face_match_threshold,
-            action_results=action_results,
-            live_embedding=None,
-            message="动作检测失败",
-        )
-
     deep_check_frames = _select_deep_check_frames(frames_by_action, expected_actions, settings)
     pose_check_frames = _select_pose_quality_frames(frames_by_action, expected_actions, settings)
-    pose_quality = _validate_pose_quality(
-        pose_check_frames,
-        settings,
-        "姿态质量",
-        settings.image_quality_live_max_abs_yaw,
-        settings.image_quality_live_max_abs_pitch,
-    )
+    # Action and pose checks use the same MediaPipe graph for this request.
+    # Creating two graphs back-to-back leaves sizeable native arenas resident
+    # in the Python process even after each context is closed.
+    with create_face_mesh() as face_mesh:
+        liveness_action_results = verify_liveness_actions(
+            frames_by_action,
+            expected_actions,
+            settings,
+            face_mesh=face_mesh,
+        )
+        action_passed = all(item["passed"] for item in liveness_action_results)
+        action_results.extend(liveness_action_results)
+        if not action_passed:
+            return VerificationEvaluation(
+                passed=False,
+                result_code="FAIL_ACTION",
+                anti_spoofing_passed=False,
+                anti_spoofing_score=0.0,
+                face_matched=False,
+                similarity=None,
+                threshold=settings.face_match_threshold,
+                action_results=action_results,
+                live_embedding=None,
+                message="动作检测失败",
+            )
+
+        # Pose frames are sampled from the action sequence and may jump back to
+        # an earlier frame. Reset tracking state when the backend supports it.
+        reset = getattr(face_mesh, "reset", None)
+        if callable(reset):
+            reset()
+        pose_quality = _validate_pose_quality(
+            pose_check_frames,
+            settings,
+            "姿态质量",
+            settings.image_quality_live_max_abs_yaw,
+            settings.image_quality_live_max_abs_pitch,
+            face_mesh=face_mesh,
+        )
+
+    # Only the deep-check frames are needed by InsightFace and PAD. Release
+    # full-resolution arrays from actions that have already been evaluated.
+    pose_check_frames.clear()
+    frames_by_action.clear()
+    all_frames.clear()
     action_results.append(pose_quality)
     if not pose_quality["passed"]:
         return VerificationEvaluation(
@@ -1345,6 +1394,7 @@ def _validate_pose_quality(
     label: str,
     max_abs_yaw: float,
     max_abs_pitch: float,
+    face_mesh=None,
 ) -> dict:
     if not frames:
         return {
@@ -1358,18 +1408,22 @@ def _validate_pose_quality(
         len(frames),
         min(settings.image_quality_sample_frames, len(frames)),
     )
+    if face_mesh is None:
+        with create_face_mesh(static_image_mode=len(frames) == 1) as owned_face_mesh:
+            return _validate_pose_quality(
+                frames,
+                settings,
+                label,
+                max_abs_yaw,
+                max_abs_pitch,
+                face_mesh=owned_face_mesh,
+            )
+
     metrics = []
-    with mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=len(frames) == 1,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    ) as face_mesh:
-        for index in indexes:
-            item = _extract_metrics(frames[index], face_mesh)
-            if item is not None:
-                metrics.append(item)
+    for index in indexes:
+        item = _extract_metrics(frames[index], face_mesh)
+        if item is not None:
+            metrics.append(item)
     if not metrics:
         return {
             "action": "pose_quality",
